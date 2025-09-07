@@ -1,0 +1,21 @@
+How to use
+
+Create + Buy + Auto-sell (recommended):
+
+npx ts-node pump_merged.ts \
+  --create --name "My Token" --symbol "MYT" --uri "https://arweave.net/<json>" \
+  --buy --sol 0.25 --auto \
+  --min_profit_bps 200 --cu_limit 600000 --cu_price 2500
+
+
+Existing mint, just Buy + Auto-sell:
+
+npx ts-node pump_merged.ts \
+  --mint <MINT> --buy --sol 0.25 --auto \
+  --min_profit_bps 200 --cu_limit 600000 --cu_price 2500
+
+
+Only Create (no auto buy):
+
+npx ts-node pump_merged.ts \
+  --create --name "My Token" --symbol "MYT" --uri "https://arweave.net/<json>"
