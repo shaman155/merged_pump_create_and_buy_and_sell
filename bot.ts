@@ -34,91 +34,211 @@ import * as anchor from "@project-serum/anchor";
 import { BN, Program, AnchorProvider, Wallet } from "@project-serum/anchor";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
+import { Metaplex } from "@metaplex-foundation/js";
 
 // -------------------- CONSTANTS -------------------- //
 
-const DEFAULT_RPC = "https://mainnet.helius-rpc.com/?api-key=058fbdd6-e88b-4b6e-8c7c-475975643524";
-const PUMP_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const FEE_ACCOUNT = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
-const TOKEN_METADATA_PROGRAM_ID = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+const DEFAULT_RPC =
+  "https://mainnet.helius-rpc.com/?api-key=058fbdd6-e88b-4b6e-8c7c-475975643524";
+const PUMP_PROGRAM_ID = new PublicKey(
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+);
+const FEE_ACCOUNT = new PublicKey(
+  "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"
+);
+const TOKEN_METADATA_PROGRAM_ID = new PublicKey(
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+);
+const WSOL_MINT = new PublicKey(
+  "So11111111111111111111111111111111111111112"
+);
 
 // -------------------- CLI -------------------- //
 
 const argv = yargs(hideBin(process.argv))
   // core
-  .option("rpc", { type: "string", default: DEFAULT_RPC, describe: "RPC endpoint" })
-  .option("mint", { type: "string", describe: "Target mint. If omitted, use --create or --watch-creations." })
-  .option("buy", { type: "boolean", default: false, describe: "Perform an initial buy before listening" })
-  .option("sol", { type: "number", default: 0, describe: "SOL to spend on initial buy (e.g., 0.25). Requires --buy." })
-  .option("auto", { type: "boolean", default: true, describe: "Enable auto-sell listener" })
+  .option("rpc", {
+    type: "string",
+    default: DEFAULT_RPC,
+    describe: "RPC endpoint",
+  })
+  .option("mint", {
+    type: "string",
+    describe:
+      "Target mint. If omitted, use --create or --watch-creations.",
+  })
+  .option("buy", {
+    type: "boolean",
+    default: false,
+    describe: "Perform an initial buy before listening",
+  })
+  .option("sol", {
+    type: "number",
+    default: 0,
+    describe: "SOL to spend on initial buy (e.g., 0.25). Requires --buy.",
+  })
+  .option("auto", {
+    type: "boolean",
+    default: true,
+    describe: "Enable auto-sell listener",
+  })
 
   // creation
-  .option("create", { type: "boolean", default: false, describe: "Create a new Pump.fun token before buying" })
+  .option("create", {
+    type: "boolean",
+    default: false,
+    describe: "Create a new Pump.fun token before buying",
+  })
   .option("name", { type: "string", describe: "Token name (for --create)" })
   .option("symbol", { type: "string", describe: "Token symbol (for --create)" })
   .option("uri", { type: "string", describe: "Metadata URI (for --create)" })
 
-  // sniper-style discovery (optional, unchanged)
-  .option("watch-creations", { type: "boolean", default: false, describe: "If true and --mint is missing, pick your latest creation" })
-  .option("scan-limit", { type: "number", default: 30, describe: "How many history txs to scan when --watch-creations" })
+  // sniper-style discovery (optional)
+  .option("watch-creations", {
+    type: "boolean",
+    default: false,
+    describe:
+      "If true and --mint is missing, pick your latest creation",
+  })
+  .option("scan-limit", {
+    type: "number",
+    default: 30,
+    describe:
+      "How many history txs to scan when --watch-creations",
+  })
 
   // auto-sell policy
-  .option("min_profit_bps", { type: "number", default: 200, describe: "Min profit bps to allow a sell (200 = 2%)" })
+  .option("min_profit_bps", {
+    type: "number",
+    default: 200,
+    describe: "Min profit bps to allow a sell (200 = 2%)",
+  })
+  .option("allow_unquoted", {
+    type: "boolean",
+    default: false,
+    describe:
+      "Allow selling even if no price quote is available (still respects 1 sell/slot & sizing rule)",
+  })
 
   // CU / priority fee (no Jito)
-  .option("cu_limit", { type: "number", default: 600_000, describe: "Compute unit limit" })
-  .option("cu_price", { type: "number", default: 2500, describe: "μLamports per CU (priority fee); 0 = none" })
+  .option("cu_limit", {
+    type: "number",
+    default: 600_000,
+    describe: "Compute unit limit",
+  })
+  .option("cu_price", {
+    type: "number",
+    default: 2500,
+    describe:
+      "μLamports per CU (priority fee); 0 = none",
+  })
 
-  .option("verbose", { type: "boolean", default: true, describe: "Verbose logs" })
-  .argv as any;
+  .option("verbose", {
+    type: "boolean",
+    default: true,
+    describe: "Verbose logs",
+  }).argv as any;
 
 // -------------------- Wallet / Program -------------------- //
 
 const KEYPAIR = Keypair.fromSecretKey(
-  Uint8Array.from(JSON.parse(fs.readFileSync(`${process.env.HOME}/my-solana-wallet.json`, "utf-8")))
+  Uint8Array.from(
+    JSON.parse(
+      fs.readFileSync(`${process.env.HOME}/my-solana-wallet.json`, "utf-8")
+    )
+  )
 );
 const WALLET = KEYPAIR.publicKey;
 
 const connection = new Connection(argv.rpc, "confirmed");
-const provider = new AnchorProvider(connection, new Wallet(KEYPAIR), { commitment: "confirmed" });
+const provider = new AnchorProvider(connection, new Wallet(KEYPAIR), {
+  commitment: "confirmed",
+});
 anchor.setProvider(provider);
 
 const idl = JSON.parse(fs.readFileSync("./pump.json", "utf-8"));
 // keep your previous workaround (disable events in IDL)
-const pumpProgram = new Program({ ...idl, events: [] } as anchor.Idl, PUMP_PROGRAM_ID, provider);
+const pumpProgram = new Program(
+  { ...idl, events: [] } as anchor.Idl,
+  PUMP_PROGRAM_ID,
+  provider
+);
 
 // -------------------- Helpers -------------------- //
 
-type PumpAccounts = Awaited<ReturnType<typeof getPumpAccounts>>;
-
-async function getPumpAccounts(mint: PublicKey, user: PublicKey, program: Program, conn: Connection) {
-  const [global] = await PublicKey.findProgramAddress([Buffer.from("global")], PUMP_PROGRAM_ID);
-  const [bondingCurve] = await PublicKey.findProgramAddress([Buffer.from("bonding-curve"), mint.toBuffer()], PUMP_PROGRAM_ID);
-  const [pool] = await PublicKey.findProgramAddress([Buffer.from("pool"), mint.toBuffer()], PUMP_PROGRAM_ID);
-  const [eventAuthority] = await PublicKey.findProgramAddress([Buffer.from("__event_authority")], PUMP_PROGRAM_ID);
+async function getPumpAccounts(
+  mint: PublicKey,
+  user: PublicKey,
+  program: Program,
+  conn: Connection
+) {
+  const [global] = await PublicKey.findProgramAddress(
+    [Buffer.from("global")],
+    PUMP_PROGRAM_ID
+  );
+  const [bondingCurve] = await PublicKey.findProgramAddress(
+    [Buffer.from("bonding-curve"), mint.toBuffer()],
+    PUMP_PROGRAM_ID
+  );
+  const [pool] = await PublicKey.findProgramAddress(
+    [Buffer.from("pool"), mint.toBuffer()],
+    PUMP_PROGRAM_ID
+  );
+  const [eventAuthority] = await PublicKey.findProgramAddress(
+    [Buffer.from("__event_authority")],
+    PUMP_PROGRAM_ID
+  );
 
   const baseMint = mint;
-  const quoteMint = new PublicKey("11111111111111111111111111111111");
+  const quoteMint = WSOL_MINT;
+
   const userBaseTokenAccount = await getAssociatedTokenAddress(baseMint, user);
   const userQuoteTokenAccount = await getAssociatedTokenAddress(quoteMint, user);
-  const poolBaseTokenAccount = await getAssociatedTokenAddress(baseMint, pool, true);
-  const poolQuoteTokenAccount = await getAssociatedTokenAddress(quoteMint, pool, true);
-  const protocolFeeRecipientTokenAccount = await getAssociatedTokenAddress(quoteMint, FEE_ACCOUNT, true);
+  const poolBaseTokenAccount = await getAssociatedTokenAddress(
+    baseMint,
+    pool,
+    true
+  );
+  const poolQuoteTokenAccount = await getAssociatedTokenAddress(
+    quoteMint,
+    pool,
+    true
+  );
+  const protocolFeeRecipientTokenAccount = await getAssociatedTokenAddress(
+    quoteMint,
+    FEE_ACCOUNT,
+    true
+  );
 
   const bcAcc = await program.account.bondingCurve.fetch(bondingCurve);
-  if (!bcAcc) throw new Error(`Could not fetch bondingCurve at ${bondingCurve.toBase58()}`);
+  if (!bcAcc)
+    throw new Error(
+      `Could not fetch bondingCurve at ${bondingCurve.toBase58()}`
+    );
 
+  // ✅ Robust creator detection via Metaplex (works for mints you didn't create)
   let creator: PublicKey = user;
   try {
-    // optional, safe to ignore failures
-    // (not strictly required for buy/sell accounts)
-  } catch {}
+    const m = Metaplex.make(conn);
+    const nft = await m.nfts().findByMint({ mintAddress: mint });
+    const upd =
+      (nft as any)?.updateAuthorityAddress ??
+      (nft as any)?.updateAuthority?.address ??
+      null;
+    if (upd) creator = new PublicKey(upd);
+  } catch {
+    // keep fallback creator = user
+  }
 
   const [creatorVault] = await PublicKey.findProgramAddress(
     [Buffer.from("creator-vault"), creator.toBuffer(), mint.toBuffer()],
     PUMP_PROGRAM_ID
   );
-  const coinCreatorVaultAta = await getAssociatedTokenAddress(baseMint, creator, true);
+  const coinCreatorVaultAta = await getAssociatedTokenAddress(
+    baseMint,
+    creator,
+    true
+  );
   const coinCreatorVaultAuthority = creator;
   const associatedBondingCurve = await getAssociatedTokenAddress(
     baseMint,
@@ -156,7 +276,12 @@ async function getPumpAccounts(mint: PublicKey, user: PublicKey, program: Progra
   };
 }
 
-async function ensureUserATA(mint: PublicKey, owner: PublicKey, payer: PublicKey, ixs: anchor.web3.TransactionInstruction[]) {
+async function ensureUserATA(
+  mint: PublicKey,
+  owner: PublicKey,
+  payer: PublicKey,
+  ixs: anchor.web3.TransactionInstruction[]
+) {
   const ata = await getAssociatedTokenAddress(mint, owner);
   const info = await connection.getAccountInfo(ata);
   if (!info) {
@@ -189,7 +314,7 @@ const state = {
     cuLimit: Number(argv.cu_limit) || 600_000,
     cuPrice: Number(argv.cu_price) || 2500,
     verbose: !!argv.verbose,
-  }
+  },
 };
 
 // -------------------- Utils -------------------- //
@@ -199,14 +324,17 @@ const fmt = (n: number) => Number(n.toFixed(6));
 
 function fractionToSell(buyerSol: number, myInitialSol: number): number {
   if (buyerSol >= 5 * myInitialSol) return 0.5; // ≥5x => 50%
-  const f = buyerSol / myInitialSol;
-  // buyer == 1x => f==1 -> sell 100%
+  const f = buyerSol / myInitialSol; // 1x => 100%
   return Math.min(Math.max(f, 0), 1);
 }
 
-// -------------------- CREATE (from your snippet) -------------------- //
+// -------------------- CREATE (integrated) -------------------- //
 
-async function createPumpToken(name: string, symbol: string, uri: string): Promise<PublicKey> {
+async function createPumpToken(
+  name: string,
+  symbol: string,
+  uri: string
+): Promise<PublicKey> {
   const mintKeypair = Keypair.generate();
   const mint = mintKeypair.publicKey;
 
@@ -218,21 +346,35 @@ async function createPumpToken(name: string, symbol: string, uri: string): Promi
     [Buffer.from("bonding-curve"), mint.toBuffer()],
     PUMP_PROGRAM_ID
   );
-  const bondingVaultAta = await getAssociatedTokenAddress(mint, bondingCurvePda, true);
-
-  const [globalStatePda] = await PublicKey.findProgramAddress([Buffer.from("global")], PUMP_PROGRAM_ID);
-
+  const bondingVaultAta = await getAssociatedTokenAddress(
+    mint,
+    bondingCurvePda,
+    true
+  );
+  const [globalStatePda] = await PublicKey.findProgramAddress(
+    [Buffer.from("global")],
+    PUMP_PROGRAM_ID
+  );
   const [metadataPda] = await PublicKey.findProgramAddress(
     [Buffer.from("metadata"), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mint.toBuffer()],
     TOKEN_METADATA_PROGRAM_ID
   );
-  const [eventAuthorityPda] = await PublicKey.findProgramAddress([Buffer.from("__event_authority")], PUMP_PROGRAM_ID);
+  const [eventAuthorityPda] = await PublicKey.findProgramAddress(
+    [Buffer.from("__event_authority")],
+    PUMP_PROGRAM_ID
+  );
 
   const ixs: anchor.web3.TransactionInstruction[] = [];
-  if (state.cfg.cuPrice > 0) ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: state.cfg.cuPrice }));
-  ixs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit }));
+  if (state.cfg.cuPrice > 0)
+    ixs.push(
+      ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: state.cfg.cuPrice,
+      })
+    );
+  ixs.push(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit })
+  );
 
-  // Build the exact create() call you shared
   const createIx = await pumpProgram.methods
     .create(name, symbol, uri, WALLET)
     .accounts({
@@ -245,7 +387,7 @@ async function createPumpToken(name: string, symbol: string, uri: string): Promi
       metadata: metadataPda,
       user: WALLET,
       systemProgram: SystemProgram.programId,
-      tokenProgram: TOKEN_PROGRAM_ID,                // legacy SPL token program
+      tokenProgram: TOKEN_PROGRAM_ID,
       associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
       rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       eventAuthority: eventAuthorityPda,
@@ -258,7 +400,9 @@ async function createPumpToken(name: string, symbol: string, uri: string): Promi
   const tx = new Transaction().add(...ixs);
   tx.feePayer = WALLET;
 
-  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR, mintKeypair], { commitment: "confirmed" });
+  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR, mintKeypair], {
+    commitment: "confirmed",
+  });
   console.log(`🎯 Created token mint: ${mint.toBase58()} (tx: ${sig})`);
   console.log(`🔗 Pump.fun page: https://pump.fun/${mint.toBase58()}`);
 
@@ -272,36 +416,48 @@ async function buildAndSendBuy_SOLCap(mint: PublicKey, solToSpend: number) {
   const globalState = await pumpProgram.account.global.fetch(accounts.global);
 
   const maxSolCost = new BN(lamports(solToSpend));
-  const amount = new BN(1); // Pump.fun buy semantics (amount is not the SOL; maxSolCost caps the SOL spend)
+  const amount = new BN(1); // Pump.fun semantics (SOL is capped via maxSolCost)
 
   const ixs: anchor.web3.TransactionInstruction[] = [];
-  if (state.cfg.cuPrice > 0) ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: state.cfg.cuPrice }));
-  ixs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit }));
+  if (state.cfg.cuPrice > 0)
+    ixs.push(
+      ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: state.cfg.cuPrice,
+      })
+    );
+  ixs.push(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit })
+  );
 
   await ensureUserATA(mint, WALLET, WALLET, ixs);
 
-  const buyIx = await pumpProgram.methods.buy(amount, maxSolCost).accounts({
-    global: accounts.global,
-    feeRecipient: (globalState as any).feeRecipient,
-    mint: accounts.baseMint,
-    bondingCurve: accounts.bondingCurve,
-    associatedBondingCurve: accounts.associatedBondingCurve,
-    associatedUser: accounts.associatedUser,
-    user: WALLET,
-    systemProgram: SystemProgram.programId,
-    tokenProgram: TOKEN_PROGRAM_ID,
-    creatorVault: accounts.creatorVault,
-    coinCreatorVaultAta: accounts.coinCreatorVaultAta,
-    coinCreatorVaultAuthority: accounts.coinCreatorVaultAuthority,
-    rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-    eventAuthority: accounts.eventAuthority,
-    program: PUMP_PROGRAM_ID,
-  }).instruction();
+  const buyIx = await pumpProgram.methods
+    .buy(amount, maxSolCost)
+    .accounts({
+      global: accounts.global,
+      feeRecipient: (globalState as any).feeRecipient,
+      mint: accounts.baseMint,
+      bondingCurve: accounts.bondingCurve,
+      associatedBondingCurve: accounts.associatedBondingCurve,
+      associatedUser: accounts.associatedUser,
+      user: WALLET,
+      systemProgram: SystemProgram.programId,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      creatorVault: accounts.creatorVault,
+      coinCreatorVaultAta: accounts.coinCreatorVaultAta,
+      coinCreatorVaultAuthority: accounts.coinCreatorVaultAuthority,
+      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      eventAuthority: accounts.eventAuthority,
+      program: PUMP_PROGRAM_ID,
+    })
+    .instruction();
 
   ixs.push(buyIx);
   const tx = new Transaction().add(...ixs);
   tx.feePayer = WALLET;
-  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR], { commitment: "confirmed" });
+  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR], {
+    commitment: "confirmed",
+  });
   console.log(`✅ BUY ${fmt(solToSpend)} SOL → ${sig}`);
 
   // Refresh post-buy token balance to set position
@@ -310,7 +466,8 @@ async function buildAndSendBuy_SOLCap(mint: PublicKey, solToSpend: number) {
   state.pos.tokensHeld = BigInt(acct.amount.toString());
   state.pos.initialSolIn = solToSpend;
   if (state.pos.tokensHeld > 0n) {
-    state.pos.avgEntrySolPerToken = state.pos.initialSolIn / Number(state.pos.tokensHeld);
+    state.pos.avgEntrySolPerToken =
+      state.pos.initialSolIn / Number(state.pos.tokensHeld);
   }
 }
 
@@ -321,10 +478,17 @@ async function buildAndSendSell(mint: PublicKey, rawTokenAmount: bigint) {
   const accounts = await getPumpAccounts(mint, WALLET, pumpProgram, connection);
 
   const ixs: anchor.web3.TransactionInstruction[] = [];
-  if (state.cfg.cuPrice > 0) ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: state.cfg.cuPrice }));
-  ixs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit }));
+  if (state.cfg.cuPrice > 0)
+    ixs.push(
+      ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: state.cfg.cuPrice,
+      })
+    );
+  ixs.push(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit })
+  );
 
-  const minSolOutput = new BN(0); // you said slippage doesn't matter
+  const minSolOutput = new BN(0); // slippage not enforced per your spec
   const sellIx = await pumpProgram.methods
     .sell(new BN(rawTokenAmount.toString()), minSolOutput)
     .accounts(accounts)
@@ -334,14 +498,20 @@ async function buildAndSendSell(mint: PublicKey, rawTokenAmount: bigint) {
 
   const tx = new Transaction().add(...ixs);
   tx.feePayer = WALLET;
-  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR], { commitment: "confirmed" });
+  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR], {
+    commitment: "confirmed",
+  });
   console.log(`💸 SELL ${rawTokenAmount.toString()} tokens → ${sig}`);
 }
 
-// -------------------- Profit Guard (simple) -------------------- //
+// -------------------- Profit Guard (quote helper) -------------------- //
 
-async function tryQuoteSellSOL(_mint: PublicKey, _tokenAmount: bigint): Promise<number | null> {
-  // Placeholder (no simulation path). We’ll use last observed price from logs if present.
+async function tryQuoteSellSOL(
+  _mint: PublicKey,
+  _tokenAmount: bigint
+): Promise<number | null> {
+  // Placeholder (no guaranteed on-chain quote). If your program emits `sol_out` in simulate logs,
+  // we can wire a simulation + regex here. For now we rely on Buy logs price or --allow_unquoted.
   return null;
 }
 
@@ -350,6 +520,7 @@ async function tryQuoteSellSOL(_mint: PublicKey, _tokenAmount: bigint): Promise<
 type BuyEvent = { mint: string; buyerSol: number; priceSolPerToken?: number };
 
 function parseBuyEventFromLogs(logs: string[]): BuyEvent | null {
+  // Looks for a generic "Program log: Buy ..." style line.
   const line = logs.find((l) => l.includes("Program log:") && /Buy/i.test(l));
   if (!line) return null;
 
@@ -367,9 +538,14 @@ function parseBuyEventFromLogs(logs: string[]): BuyEvent | null {
 
 // -------------------- Auto-sell Engine -------------------- //
 
-async function maybeAutoSell(mint: PublicKey, slot: number, buyerSol: number, lastPrice?: number) {
+async function maybeAutoSell(
+  mint: PublicKey,
+  slot: number,
+  buyerSol: number,
+  lastPrice?: number
+) {
   if (state.pos.tokensHeld <= 0n || state.pos.initialSolIn <= 0) return;
-  if (state.pos.lastSellSlot === slot) return;
+  if (state.pos.lastSellSlot === slot) return; // 1 sell per slot
 
   const frac = fractionToSell(buyerSol, state.pos.initialSolIn);
   if (frac <= 0) return;
@@ -377,9 +553,10 @@ async function maybeAutoSell(mint: PublicKey, slot: number, buyerSol: number, la
   const toSell = BigInt(Math.floor(Number(state.pos.tokensHeld) * frac));
   if (toSell < 1n) return;
 
+  // Profit guard
   let estSolOut: number | null = await tryQuoteSellSOL(mint, toSell);
   if (!estSolOut && lastPrice && state.pos.avgEntrySolPerToken) {
-    estSolOut = Number(toSell) * lastPrice * 0.985; // small haircut
+    estSolOut = Number(toSell) * lastPrice * 0.985; // haircut
   }
 
   if (estSolOut && state.pos.avgEntrySolPerToken) {
@@ -388,13 +565,25 @@ async function maybeAutoSell(mint: PublicKey, slot: number, buyerSol: number, la
     const pnlBps = Math.floor(pnl * 10_000);
     if (pnlBps < state.cfg.minProfitBps) {
       if (state.cfg.verbose) {
-        console.log(`🟨 slot ${slot}: buyer=${fmt(buyerSol)} SOL → proposed sell ${fmt(frac * 100)}% but est PnL ${pnlBps}bps < ${state.cfg.minProfitBps}bps. Skip.`);
+        console.log(
+          `🟨 slot ${slot}: buyer=${fmt(
+            buyerSol
+          )} SOL → proposed sell ${fmt(
+            frac * 100
+          )}% but est PnL ${pnlBps}bps < ${state.cfg.minProfitBps}bps. Skip.`
+        );
       }
       return;
     }
   } else {
-    if (state.cfg.verbose) console.log(`🟨 slot ${slot}: no reliable quote for ≥${state.cfg.minProfitBps}bps; skipping sell.`);
-    return;
+    if (!argv.allow_unquoted) {
+      if (state.cfg.verbose)
+        console.log(
+          `🟨 slot ${slot}: no quote & price missing; skipping sell (use --allow_unquoted to override).`
+        );
+      return;
+    }
+    // proceed without quote
   }
 
   await buildAndSendSell(mint, toSell);
@@ -412,7 +601,11 @@ function subscribeBuyEvents(mint: PublicKey) {
         const ev = parseBuyEventFromLogs(res.logs || []);
         if (!ev || ev.mint !== mint.toBase58()) return;
 
-        console.log(`🔔 Buy detected @slot ${res.slot}: ${fmt(ev.buyerSol)} SOL on mint ${ev.mint}`);
+        console.log(
+          `🔔 Buy detected @slot ${res.slot}: ${fmt(
+            ev.buyerSol
+          )} SOL on mint ${ev.mint}`
+        );
         await maybeAutoSell(mint, res.slot, ev.buyerSol, ev.priceSolPerToken);
       } catch (e) {
         console.error("onLogs handler error:", e);
@@ -420,15 +613,19 @@ function subscribeBuyEvents(mint: PublicKey) {
     },
     "confirmed"
   );
-  console.log(`👂 Listening for Buy events on ${mint.toBase58()} (subId=${subId})`);
+  console.log(
+    `👂 Listening for Buy events on ${mint.toBase58()} (subId=${subId})`
+  );
   return subId;
 }
 
-// -------------------- Optional: scan your creations (unchanged) -------------------- //
+// -------------------- Optional: scan your creations -------------------- //
 
 function extractAccounts(ix: ParsedInstruction | PartiallyDecodedInstruction): string[] {
   if ("accounts" in ix && (ix as any).accounts) {
-    return (ix as any).accounts.map((a: any) => (typeof a === "string" ? a : a?.toBase58?.() || String(a)));
+    return (ix as any).accounts.map((a: any) =>
+      typeof a === "string" ? a : a?.toBase58?.() || String(a)
+    );
   }
   return [];
 }
@@ -438,24 +635,45 @@ async function getPumpCreations(conn: Connection, wallet: PublicKey, limit: numb
   const results: any[] = [];
 
   for (const { signature, blockTime } of signatures) {
-    const tx = await conn.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
+    const tx = await conn.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+    });
     if (!tx) continue;
 
-    for (const ix of tx.transaction.message.instructions as (ParsedInstruction | PartiallyDecodedInstruction)[]) {
-      const progId = (ix as any).programId?.toBase58?.() || (ix as any).programId || "";
+    for (const ix of tx.transaction.message
+      .instructions as (ParsedInstruction | PartiallyDecodedInstruction)[]) {
+      const progId =
+        (ix as any).programId?.toBase58?.() || (ix as any).programId || "";
       if (progId === PUMP_PROGRAM_ID.toBase58()) {
         const accounts = extractAccounts(ix);
-        results.push({ signature, mint: accounts[0] || "", pool: accounts[0] || "", blockTime: blockTime || 0, foundIn: "top-level", allAccounts: accounts });
+        results.push({
+          signature,
+          mint: accounts[0] || "",
+          pool: accounts[0] || "",
+          blockTime: blockTime || 0,
+          foundIn: "top-level",
+          allAccounts: accounts,
+        });
       }
     }
 
     if (tx.meta?.innerInstructions) {
       for (const inner of tx.meta.innerInstructions) {
         for (const ix of inner.instructions as (ParsedInstruction | PartiallyDecodedInstruction)[]) {
-          const progId = (ix as any).programId?.toBase58?.() || (ix as any).programId || "";
+          const progId =
+            (ix as any).programId?.toBase58?.() ||
+            (ix as any).programId ||
+            "";
           if (progId === PUMP_PROGRAM_ID.toBase58()) {
             const accounts = extractAccounts(ix);
-            results.push({ signature, mint: accounts[0] || "", pool: accounts[0] || "", blockTime: blockTime || 0, foundIn: "inner", allAccounts: accounts });
+            results.push({
+              signature,
+              mint: accounts[0] || "",
+              pool: accounts[0] || "",
+              blockTime: blockTime || 0,
+              foundIn: "inner",
+              allAccounts: accounts,
+            });
           }
         }
       }
@@ -469,12 +687,14 @@ async function getPumpCreations(conn: Connection, wallet: PublicKey, limit: numb
 (async () => {
   console.log(`👤 Wallet: ${WALLET.toBase58()}`);
   console.log(`🔗 RPC: ${argv.rpc}`);
-  console.log(`⚙️ CU: limit=${state.cfg.cuLimit}, price=${state.cfg.cuPrice} μLamports`);
+  console.log(
+    `⚙️ CU: limit=${state.cfg.cuLimit}, price=${state.cfg.cuPrice} μLamports`
+  );
   console.log(`🔧 Profit guard: >= ${state.cfg.minProfitBps} bps`);
 
   let targetMint: PublicKey | null = argv.mint ? new PublicKey(argv.mint) : null;
 
-  // 1) Optional: create a token first (uses your create() logic)
+  // 1) Optional: create a token first
   if (argv.create) {
     if (!argv.name || !argv.symbol || !argv.uri) {
       throw new Error("For --create you must provide --name, --symbol, and --uri");
@@ -484,7 +704,11 @@ async function getPumpCreations(conn: Connection, wallet: PublicKey, limit: numb
 
   // 2) Optional: discover your latest creation if no mint provided
   if (!targetMint && argv.watch_creations) {
-    const items = await getPumpCreations(connection, WALLET, Math.max(argv.scan_limit ?? 30, 30));
+    const items = await getPumpCreations(
+      connection,
+      WALLET,
+      Math.max(argv.scan_limit ?? 30, 30)
+    );
     if (items.length && items[0].mint) {
       targetMint = new PublicKey(items[0].mint);
       console.log(`🆕 Latest created mint detected: ${targetMint.toBase58()}`);
@@ -504,12 +728,14 @@ async function getPumpCreations(conn: Connection, wallet: PublicKey, limit: numb
     if (!(solToSpend > 0)) throw new Error("--sol must be > 0 with --buy");
     await buildAndSendBuy_SOLCap(targetMint, solToSpend);
   } else {
-    // if you already hold tokens, prime position
+    // If you already hold tokens, prime position for auto-sell
     try {
       const ata = await getAssociatedTokenAddress(targetMint, WALLET);
       const acct = await getAccount(connection, ata);
       state.pos.tokensHeld = BigInt(acct.amount.toString());
-      console.log(`📦 Position (pre-existing): tokensHeld=${state.pos.tokensHeld.toString()}`);
+      console.log(
+        `📦 Position (pre-existing): tokensHeld=${state.pos.tokensHeld.toString()}`
+      );
     } catch {
       console.log("ℹ️ No tokens currently held (or ATA missing).");
     }
