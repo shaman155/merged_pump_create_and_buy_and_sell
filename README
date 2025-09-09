@@ -1,3 +1,192 @@
+Pump Agent — Create → Buy in SOL → Auto-Sell on Buys
+
+A single TypeScript bot that can:
+
+Create a Pump.fun token (name/symbol/URI)
+
+Buy with a fixed SOL budget (not “token amount”)
+
+Listen for external Buy events on your mint
+
+Auto-sell a portion of your position based on the buyer’s SOL size
+
+Enforce ≥ +2% profit guard (configurable), one sell per slot, CU bump, no Jito
+
+Sizing rule
+• If someone buys 1× your initial SOL, you sell 100% of remaining.
+• If someone buys ≥ 5× your initial SOL, you sell 50%.
+• Otherwise: sell min(buyerSOL / yourInitialSOL, 1).
+
+1) Prerequisites
+
+Node.js 18+ and npm (or pnpm/yarn)
+
+A Solana wallet JSON at ~/my-solana-wallet.json (same format as your current scripts)
+
+A Mainnet RPC endpoint (Helius or similar)
+
+The Pump.fun IDL as ./pump.json in the project root (matching on-chain program 6EF8r...F6P)
+
+⚠️ This bot sends mainnet transactions. Use a fresh wallet and tiny amounts for testing.
+
+2) Installation
+
+Create (or use) a project folder and place both files in it:
+
+pump_merged.ts (the bot)
+
+pump.json (Pump.fun IDL)
+
+mkdir pump-agent && cd pump-agent
+# add pump_merged.ts and pump.json into this folder
+
+
+Install dependencies:
+
+npm init -y
+
+npm install \
+  @project-serum/anchor \
+  @solana/web3.js \
+  @solana/spl-token \
+  @metaplex-foundation/js \
+  yargs \
+  bn.js
+
+npm install -D typescript ts-node @types/node
+
+
+Create a minimal tsconfig.json (recommended):
+
+{
+  "compilerOptions": {
+    "target": "ES2021",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+
+
+(Optional) Add a run script to package.json:
+
+{
+  "scripts": {
+    "start": "ts-node pump_merged.ts"
+  }
+}
+
+3) Quick Start (one-liners)
+Create → Buy (SOL) → Auto-Sell
+npx ts-node pump_merged.ts \
+  --rpc "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" \
+  --create --name "My Token" --symbol "MYT" --uri "https://arweave.net/<metadata_json>" \
+  --buy --sol 0.25 --auto \
+  --min_profit_bps 200 \
+  --cu_limit 600000 --cu_price 2500 \
+  --allow_unquoted
+
+Existing Mint → Buy (SOL) → Auto-Sell
+npx ts-node pump_merged.ts \
+  --rpc "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" \
+  --mint <MINT_ADDRESS> \
+  --buy --sol 0.25 --auto \
+  --min_profit_bps 200 \
+  --cu_limit 600000 --cu_price 2500 \
+  --allow_unquoted
+
+Existing Position Only → Auto-Sell
+npx ts-node pump_merged.ts \
+  --rpc "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" \
+  --mint <MINT_ADDRESS> \
+  --auto \
+  --min_profit_bps 200
+
+Discover Latest Creation → Buy (SOL) → Auto-Sell
+npx ts-node pump_merged.ts \
+  --rpc "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" \
+  --watch-creations --scan-limit 50 \
+  --buy --sol 0.05 --auto \
+  --min_profit_bps 200
+
+Only Create (no buy/listen)
+npx ts-node pump_merged.ts \
+  --rpc "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" \
+  --create --name "My Token" --symbol "MYT" --uri "https://arweave.net/<metadata_json>"
+
+4) CLI Flags
+Flag	Type	Default	Description
+--rpc	string	Helius example in code	RPC endpoint
+--mint	string	—	Target mint to trade
+--create	boolean	false	Create a new token (requires --name --symbol --uri)
+--name	string	—	Token name (for --create)
+--symbol	string	—	Token symbol (for --create)
+--uri	string	—	Metadata URI (for --create)
+--buy	boolean	false	Perform initial buy
+--sol	number	0	SOL to spend on initial buy (requires --buy)
+--auto	boolean	true	Enable auto-sell listener
+--watch-creations	boolean	false	If no --mint, pick your wallet’s latest Pump.fun creation
+--scan-limit	number	30	Max wallet txs to scan with --watch-creations
+--min_profit_bps	number	200	Min profit (bps) required to sell; 200 = 2%
+--allow_unquoted	boolean	false	If no price quote/logs available, still sell (still 1 sell/slot & sizing rule)
+--cu_limit	number	600000	Compute unit limit (priority tuning)
+--cu_price	number	2500	μLamports per CU (priority fee); 0 = none
+--verbose	boolean	true	Verbose logs
+
+Note: yargs converts hyphenated flags to camelCase internally; you should pass them as shown above (--watch-creations, --scan-limit).
+
+5) Behavior & Notes
+
+Buy in SOL: you specify a SOL budget (--sol); the bot caps SOL spent via maxSolCost.
+
+Auto-sell rule: sells proportionally to external buyer’s SOL; one sell per slot to avoid spam.
+
+Profit guard: requires estimated PnL ≥ --min_profit_bps. If no price logs are available, use --allow_unquoted to proceed anyway.
+
+Creator detection: Metaplex updateAuthority lookup lets you buy/sell tokens you didn’t create.
+
+Priority fees: set with --cu_limit and --cu_price. No Jito.
+
+6) Troubleshooting
+
+Could not fetch bondingCurve
+Ensure the mint is a Pump.fun token and pump.json matches the deployed program.
+
+Invalid account keys / account mismatch
+Usually IDL mismatch or wrong PDAs. Verify you’re on 6EF8r...F6P and using the provided PDAs.
+
+Listener is silent / sells never fire
+
+RPC may be dropping logs—try a different endpoint.
+
+Ensure you actually hold tokens (bot logs tokensHeld).
+
+Without price= in logs and no quote path, either pass --allow_unquoted or ask us to wire a simulation-based quote.
+
+Out of compute
+Increase --cu_limit (e.g., 700000) or reduce --cu_price.
+
+7) Security
+
+Keep ~/my-solana-wallet.json private.
+
+Use a fresh wallet for testing.
+
+Start with tiny SOL amounts (e.g., --sol 0.001) before scaling.
+
+8) License
+
+Private/Proprietary. Use at your own risk.
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
 How to use
 
 Create + Buy + Auto-sell (recommended):
