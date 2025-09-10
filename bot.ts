@@ -1,16 +1,19 @@
 #!/usr/bin/env ts-node
 
 /**
- * pump_merged.ts
- * One file to:
- *  - (optional) create a new Pump.fun token (name/symbol/uri)
- *  - buy with SOL cap (not token amount)
- *  - listen for external "Buy" events on your mint and auto-sell proportionally
- *  - apply profit guard: sell only if estimated PnL >= +2% (configurable)
- *  - throttle to 1 sell per slot, CU bump, no Jito
+ * pump_merged.ts — merged working logic
+ *
+ * - Imports fixed (SPL token helpers, yargs helpers)
+ * - Buy/Sell wired via Anchor program methods (from sniper-bot.ts), including feeRecipient
+ * - Slot-based auto-sell after N blocks (from both buy-from-pump/sniper-bot)
+ * - Optional direct-discriminator build path preserved behind a toggle
+ *
+ * Required local file: ./pump.json (IDL)
+ * Required wallet:  ~/my-solana-wallet.json (or override with --kp)
  */
 
 import fs from "fs";
+import path from "path";
 import {
   Connection,
   PublicKey,
@@ -20,233 +23,139 @@ import {
   sendAndConfirmTransaction,
   LAMPORTS_PER_SOL,
   Transaction,
-  ParsedInstruction,
-  PartiallyDecodedInstruction,
+  Logs,
 } from "@solana/web3.js";
+
 import {
   getAccount,
-  getAssociatedTokenAddress,
+  getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
+
+import { Metaplex } from "@metaplex-foundation/js";
 import * as anchor from "@project-serum/anchor";
 import { BN, Program, AnchorProvider, Wallet } from "@project-serum/anchor";
-import yargs from "yargs";
+
+import yargs from "yargs/yargs";
 import { hideBin } from "yargs/helpers";
-import { Metaplex } from "@metaplex-foundation/js";
 
-// -------------------- CONSTANTS -------------------- //
-
-const DEFAULT_RPC =
-  "https://mainnet.helius-rpc.com/?api-key=058fbdd6-e88b-4b6e-8c7c-475975643524";
-const PUMP_PROGRAM_ID = new PublicKey(
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-);
-const FEE_ACCOUNT = new PublicKey(
-  "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"
-);
-const TOKEN_METADATA_PROGRAM_ID = new PublicKey(
-  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-);
-const WSOL_MINT = new PublicKey(
-  "So11111111111111111111111111111111111111112"
-);
-
-// -------------------- CLI -------------------- //
+/* ----------------------------- CLI ARGUMENTS ----------------------------- */
 
 const argv = yargs(hideBin(process.argv))
-  // core
-  .option("rpc", {
-    type: "string",
-    default: DEFAULT_RPC,
-    describe: "RPC endpoint",
-  })
-  .option("mint", {
-    type: "string",
-    describe:
-      "Target mint. If omitted, use --create or --watch-creations.",
-  })
-  .option("buy", {
-    type: "boolean",
-    default: false,
-    describe: "Perform an initial buy before listening",
-  })
-  .option("sol", {
-    type: "number",
-    default: 0,
-    describe: "SOL to spend on initial buy (e.g., 0.25). Requires --buy.",
-  })
-  .option("auto", {
-    type: "boolean",
-    default: true,
-    describe: "Enable auto-sell listener",
-  })
+  .scriptName("pump_merged")
+  .option("rpc", { type: "string", demandOption: true, desc: "RPC endpoint" })
+  .option("kp", { type: "string", default: "~/my-solana-wallet.json", desc: "Keypair JSON path" })
+  .option("mint", { type: "string", desc: "Target token mint (base mint)" })
+  .option("buy", { type: "boolean", default: false, desc: "Execute an initial buy" })
+  .option("sol", { type: "number", default: 0, desc: "SOL amount to spend on buy" })
+  .option("auto", { type: "boolean", default: false, desc: "Enable auto-sell after SLOT_WAIT blocks" })
+  .option("blocks", { type: "number", default: 10, desc: "Blocks to wait before auto-sell" })
+  .option("limit", { type: "number", default: 30, desc: "How many historical txs to check (unused here)" })
+  .help()
+  .parseSync();
 
-  // creation
-  .option("create", {
-    type: "boolean",
-    default: false,
-    describe: "Create a new Pump.fun token before buying",
-  })
-  .option("name", { type: "string", describe: "Token name (for --create)" })
-  .option("symbol", { type: "string", describe: "Token symbol (for --create)" })
-  .option("uri", { type: "string", describe: "Metadata URI (for --create)" })
+/* ------------------------------ CONSTANTS -------------------------------- */
 
-  // sniper-style discovery (optional)
-  .option("watch-creations", {
-    type: "boolean",
-    default: false,
-    describe:
-      "If true and --mint is missing, pick your latest creation",
-  })
-  .option("scan-limit", {
-    type: "number",
-    default: 30,
-    describe:
-      "How many history txs to scan when --watch-creations",
-  })
+const PUMP_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const FEE_ACCOUNT = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
 
-  // auto-sell policy
-  .option("min_profit_bps", {
-    type: "number",
-    default: 200,
-    describe: "Min profit bps to allow a sell (200 = 2%)",
-  })
-  .option("allow_unquoted", {
-    type: "boolean",
-    default: false,
-    describe:
-      "Allow selling even if no price quote is available (still respects 1 sell/slot & sizing rule)",
-  })
+// Optionally use the “raw discriminator” build path from buy-from-pump.ts
+// Set to true to use raw instructions; false = Anchor methods (default).
+const USE_RAW_DISCRIMINATOR_BUILD = false;
 
-  // CU / priority fee (no Jito)
-  .option("cu_limit", {
-    type: "number",
-    default: 600_000,
-    describe: "Compute unit limit",
-  })
-  .option("cu_price", {
-    type: "number",
-    default: 2500,
-    describe:
-      "μLamports per CU (priority fee); 0 = none",
-  })
+// Discriminators + constants (for raw build path)
+const BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+const SELL_DISCRIMINATOR = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
+const RAW_GLOBAL_PDA = PublicKey.findProgramAddressSync([Buffer.from("global")], PUMP_PROGRAM_ID)[0];
+const RAW_EVENT_AUTHORITY = PublicKey.findProgramAddressSync([Buffer.from("__event_authority")], PUMP_PROGRAM_ID)[0];
+const CREATOR_VAULT_FALLBACK = new PublicKey("FywGmh1itGfrGWnBhTCnnGeWLppMUEe9QZTrDj73SVum");
 
-  .option("verbose", {
-    type: "boolean",
-    default: true,
-    describe: "Verbose logs",
-  }).argv as any;
+// IDL (required for Anchor path)
+const idl = JSON.parse(fs.readFileSync("./pump.json", "utf-8"));
+const minimalIdl = { ...idl, events: [] }; // disable event decoding
 
-// -------------------- Wallet / Program -------------------- //
+/* ------------------------------ UTIL HELPERS ----------------------------- */
 
-const KEYPAIR = Keypair.fromSecretKey(
-  Uint8Array.from(
-    JSON.parse(
-      fs.readFileSync(`${process.env.HOME}/my-solana-wallet.json`, "utf-8")
-    )
-  )
-);
+function expandHome(p: string): string {
+  return p.startsWith("~/") ? path.join(process.env.HOME || "", p.slice(2)) : p;
+}
+
+function loadKeypair(filePath: string): Keypair {
+  const full = expandHome(filePath);
+  const raw = JSON.parse(fs.readFileSync(full, "utf-8"));
+  return Keypair.fromSecretKey(Uint8Array.from(raw));
+}
+
+function fmtLamports(lamports: number | bigint) {
+  return (Number(lamports) / LAMPORTS_PER_SOL).toFixed(6) + " SOL";
+}
+
+const connection = new Connection(argv.rpc, { commitment: "confirmed" });
+const KEYPAIR = loadKeypair(argv.kp);
 const WALLET = KEYPAIR.publicKey;
 
-const connection = new Connection(argv.rpc, "confirmed");
-const provider = new AnchorProvider(connection, new Wallet(KEYPAIR), {
-  commitment: "confirmed",
-});
+/* ------------------------- SPL / ATA Helper (Sync) ----------------------- */
+
+async function ensureAta(owner: PublicKey, mint: PublicKey) {
+  const ata = getAssociatedTokenAddressSync(mint, owner, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+  const ix = createAssociatedTokenAccountInstruction(
+    WALLET, // payer
+    ata,
+    owner,
+    mint,
+    TOKEN_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+  // Optimistic create: it's fine if already exists
+  return { ata, ixMaybe: ix };
+}
+
+/* ------------------------- ANCHOR: PROGRAM/PROVIDER ---------------------- */
+
+const provider = new AnchorProvider(connection, new Wallet(KEYPAIR), { commitment: "confirmed" });
 anchor.setProvider(provider);
+const pumpProgram = new Program(minimalIdl as anchor.Idl, PUMP_PROGRAM_ID, provider);
 
-const idl = JSON.parse(fs.readFileSync("./pump.json", "utf-8"));
-// keep your previous workaround (disable events in IDL)
-const pumpProgram = new Program(
-  { ...idl, events: [] } as anchor.Idl,
-  PUMP_PROGRAM_ID,
-  provider
-);
+/* --------------------------- ACCOUNT DERIVATIONS ------------------------- */
 
-// -------------------- Helpers -------------------- //
-
-async function getPumpAccounts(
-  mint: PublicKey,
-  user: PublicKey,
-  program: Program,
-  conn: Connection
-) {
-  const [global] = await PublicKey.findProgramAddress(
-    [Buffer.from("global")],
-    PUMP_PROGRAM_ID
-  );
-  const [bondingCurve] = await PublicKey.findProgramAddress(
-    [Buffer.from("bonding-curve"), mint.toBuffer()],
-    PUMP_PROGRAM_ID
-  );
-  const [pool] = await PublicKey.findProgramAddress(
-    [Buffer.from("pool"), mint.toBuffer()],
-    PUMP_PROGRAM_ID
-  );
-  const [eventAuthority] = await PublicKey.findProgramAddress(
-    [Buffer.from("__event_authority")],
-    PUMP_PROGRAM_ID
-  );
+async function getPumpAccounts(mint: PublicKey, user: PublicKey) {
+  const [global] = await PublicKey.findProgramAddress([Buffer.from("global")], PUMP_PROGRAM_ID);
+  const [bondingCurve] = await PublicKey.findProgramAddress([Buffer.from("bonding-curve"), mint.toBuffer()], PUMP_PROGRAM_ID);
+  const [pool] = await PublicKey.findProgramAddress([Buffer.from("pool"), mint.toBuffer()], PUMP_PROGRAM_ID);
+  const [eventAuthority] = await PublicKey.findProgramAddress([Buffer.from("__event_authority")], PUMP_PROGRAM_ID);
 
   const baseMint = mint;
-  const quoteMint = WSOL_MINT;
+  const quoteMint = new PublicKey("11111111111111111111111111111111"); // SOL token (native)
+  const userBaseTokenAccount = getAssociatedTokenAddressSync(baseMint, user, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+  const userQuoteTokenAccount = getAssociatedTokenAddressSync(quoteMint, user, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+  const poolBaseTokenAccount = getAssociatedTokenAddressSync(baseMint, pool, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+  const poolQuoteTokenAccount = getAssociatedTokenAddressSync(quoteMint, pool, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+  const protocolFeeRecipientTokenAccount = getAssociatedTokenAddressSync(quoteMint, FEE_ACCOUNT, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
 
-  const userBaseTokenAccount = await getAssociatedTokenAddress(baseMint, user);
-  const userQuoteTokenAccount = await getAssociatedTokenAddress(quoteMint, user);
-  const poolBaseTokenAccount = await getAssociatedTokenAddress(
-    baseMint,
-    pool,
-    true
-  );
-  const poolQuoteTokenAccount = await getAssociatedTokenAddress(
-    quoteMint,
-    pool,
-    true
-  );
-  const protocolFeeRecipientTokenAccount = await getAssociatedTokenAddress(
-    quoteMint,
-    FEE_ACCOUNT,
-    true
-  );
+  // Ensure bondingCurve exists per your code
+  const bondingCurveAcc = await pumpProgram.account.bondingCurve.fetch(bondingCurve);
+  if (!bondingCurveAcc) throw new Error(`Could not fetch bondingCurve at ${bondingCurve.toBase58()}`);
 
-  const bcAcc = await program.account.bondingCurve.fetch(bondingCurve);
-  if (!bcAcc)
-    throw new Error(
-      `Could not fetch bondingCurve at ${bondingCurve.toBase58()}`
-    );
-
-  // ✅ Robust creator detection via Metaplex (works for mints you didn't create)
+  // Derive creator (try metadata updateAuthority; fallback to wallet)
   let creator: PublicKey = user;
   try {
-    const m = Metaplex.make(conn);
-    const nft = await m.nfts().findByMint({ mintAddress: mint });
-    const upd =
-      (nft as any)?.updateAuthorityAddress ??
-      (nft as any)?.updateAuthority?.address ??
-      null;
-    if (upd) creator = new PublicKey(upd);
+    const metaplex = Metaplex.make(connection);
+    const nft = await metaplex.nfts().findByMint({ mintAddress: mint });
+    const ua = (nft as any)?.updateAuthorityAddress;
+    if (ua) creator = ua as PublicKey;
   } catch {
-    // keep fallback creator = user
+    // ignore metadata failures
   }
 
   const [creatorVault] = await PublicKey.findProgramAddress(
     [Buffer.from("creator-vault"), creator.toBuffer(), mint.toBuffer()],
     PUMP_PROGRAM_ID
   );
-  const coinCreatorVaultAta = await getAssociatedTokenAddress(
-    baseMint,
-    creator,
-    true
-  );
+  const coinCreatorVaultAta = getAssociatedTokenAddressSync(baseMint, creator, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
   const coinCreatorVaultAuthority = creator;
-  const associatedBondingCurve = await getAssociatedTokenAddress(
-    baseMint,
-    bondingCurve,
-    true,
-    TOKEN_PROGRAM_ID,
-    ASSOCIATED_TOKEN_PROGRAM_ID
-  );
+  const associatedBondingCurve = getAssociatedTokenAddressSync(baseMint, bondingCurve, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
 
   return {
     pool,
@@ -276,166 +185,39 @@ async function getPumpAccounts(
   };
 }
 
-async function ensureUserATA(
-  mint: PublicKey,
-  owner: PublicKey,
-  payer: PublicKey,
-  ixs: anchor.web3.TransactionInstruction[]
-) {
-  const ata = await getAssociatedTokenAddress(mint, owner);
-  const info = await connection.getAccountInfo(ata);
-  if (!info) {
+/* ------------------------------ BUY / SELL ------------------------------- */
+
+/** Anchor-path BUY (from sniper-bot.ts) */
+async function ixBuyPump_Anchor(mint: PublicKey, lamportsIn: number) {
+  const accounts = await getPumpAccounts(mint, WALLET);
+  const globalState = await pumpProgram.account.global.fetch(accounts.global);
+  const amount = new BN(1);
+  const maxSolCost = new BN(lamportsIn);
+
+  const ixs: anchor.web3.TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5000 }),
+  ];
+
+  // Ensure ATA exists
+  const ataInfo = await connection.getAccountInfo(accounts.associatedUser);
+  if (!ataInfo) {
     ixs.push(
       createAssociatedTokenAccountInstruction(
-        payer,
-        ata,
-        owner,
-        mint,
+        WALLET,
+        accounts.associatedUser,
+        WALLET,
+        accounts.baseMint,
         TOKEN_PROGRAM_ID,
         ASSOCIATED_TOKEN_PROGRAM_ID
       )
     );
   }
-  return ata;
-}
-
-// -------------------- Position State -------------------- //
-
-const state = {
-  pos: {
-    initialSolIn: 0,
-    tokensHeld: 0n,
-    avgEntrySolPerToken: null as number | null,
-    lastSellSlot: null as number | null,
-    realizedSol: 0,
-  },
-  cfg: {
-    minProfitBps: Number(argv.min_profit_bps) || 200,
-    cuLimit: Number(argv.cu_limit) || 600_000,
-    cuPrice: Number(argv.cu_price) || 2500,
-    verbose: !!argv.verbose,
-  },
-};
-
-// -------------------- Utils -------------------- //
-
-const lamports = (sol: number) => Math.floor(sol * LAMPORTS_PER_SOL);
-const fmt = (n: number) => Number(n.toFixed(6));
-
-function fractionToSell(buyerSol: number, myInitialSol: number): number {
-  if (buyerSol >= 5 * myInitialSol) return 0.5; // ≥5x => 50%
-  const f = buyerSol / myInitialSol; // 1x => 100%
-  return Math.min(Math.max(f, 0), 1);
-}
-
-// -------------------- CREATE (integrated) -------------------- //
-
-async function createPumpToken(
-  name: string,
-  symbol: string,
-  uri: string
-): Promise<PublicKey> {
-  const mintKeypair = Keypair.generate();
-  const mint = mintKeypair.publicKey;
-
-  const [mintAuthorityPda] = await PublicKey.findProgramAddress(
-    [Buffer.from("mint-authority")],
-    PUMP_PROGRAM_ID
-  );
-  const [bondingCurvePda] = await PublicKey.findProgramAddress(
-    [Buffer.from("bonding-curve"), mint.toBuffer()],
-    PUMP_PROGRAM_ID
-  );
-  const bondingVaultAta = await getAssociatedTokenAddress(
-    mint,
-    bondingCurvePda,
-    true
-  );
-  const [globalStatePda] = await PublicKey.findProgramAddress(
-    [Buffer.from("global")],
-    PUMP_PROGRAM_ID
-  );
-  const [metadataPda] = await PublicKey.findProgramAddress(
-    [Buffer.from("metadata"), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mint.toBuffer()],
-    TOKEN_METADATA_PROGRAM_ID
-  );
-  const [eventAuthorityPda] = await PublicKey.findProgramAddress(
-    [Buffer.from("__event_authority")],
-    PUMP_PROGRAM_ID
-  );
-
-  const ixs: anchor.web3.TransactionInstruction[] = [];
-  if (state.cfg.cuPrice > 0)
-    ixs.push(
-      ComputeBudgetProgram.setComputeUnitPrice({
-        microLamports: state.cfg.cuPrice,
-      })
-    );
-  ixs.push(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit })
-  );
-
-  const createIx = await pumpProgram.methods
-    .create(name, symbol, uri, WALLET)
-    .accounts({
-      mint,
-      mintAuthority: mintAuthorityPda,
-      bondingCurve: bondingCurvePda,
-      associatedBondingCurve: bondingVaultAta,
-      global: globalStatePda,
-      mplTokenMetadata: TOKEN_METADATA_PROGRAM_ID,
-      metadata: metadataPda,
-      user: WALLET,
-      systemProgram: SystemProgram.programId,
-      tokenProgram: TOKEN_PROGRAM_ID,
-      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-      eventAuthority: eventAuthorityPda,
-      program: PUMP_PROGRAM_ID,
-    })
-    .instruction();
-
-  ixs.push(createIx);
-
-  const tx = new Transaction().add(...ixs);
-  tx.feePayer = WALLET;
-
-  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR, mintKeypair], {
-    commitment: "confirmed",
-  });
-  console.log(`🎯 Created token mint: ${mint.toBase58()} (tx: ${sig})`);
-  console.log(`🔗 Pump.fun page: https://pump.fun/${mint.toBase58()}`);
-
-  return mint;
-}
-
-// -------------------- BUY (SOL cap) -------------------- //
-
-async function buildAndSendBuy_SOLCap(mint: PublicKey, solToSpend: number) {
-  const accounts = await getPumpAccounts(mint, WALLET, pumpProgram, connection);
-  const globalState = await pumpProgram.account.global.fetch(accounts.global);
-
-  const maxSolCost = new BN(lamports(solToSpend));
-  const amount = new BN(1); // Pump.fun semantics (SOL is capped via maxSolCost)
-
-  const ixs: anchor.web3.TransactionInstruction[] = [];
-  if (state.cfg.cuPrice > 0)
-    ixs.push(
-      ComputeBudgetProgram.setComputeUnitPrice({
-        microLamports: state.cfg.cuPrice,
-      })
-    );
-  ixs.push(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit })
-  );
-
-  await ensureUserATA(mint, WALLET, WALLET, ixs);
 
   const buyIx = await pumpProgram.methods
     .buy(amount, maxSolCost)
     .accounts({
       global: accounts.global,
-      feeRecipient: (globalState as any).feeRecipient,
+      feeRecipient: (globalState as any).feeRecipient, // CRUCIAL
       mint: accounts.baseMint,
       bondingCurve: accounts.bondingCurve,
       associatedBondingCurve: accounts.associatedBondingCurve,
@@ -453,302 +235,191 @@ async function buildAndSendBuy_SOLCap(mint: PublicKey, solToSpend: number) {
     .instruction();
 
   ixs.push(buyIx);
-  const tx = new Transaction().add(...ixs);
-  tx.feePayer = WALLET;
-  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR], {
-    commitment: "confirmed",
-  });
-  console.log(`✅ BUY ${fmt(solToSpend)} SOL → ${sig}`);
-
-  // Refresh post-buy token balance to set position
-  const ata = await getAssociatedTokenAddress(mint, WALLET);
-  const acct = await getAccount(connection, ata);
-  state.pos.tokensHeld = BigInt(acct.amount.toString());
-  state.pos.initialSolIn = solToSpend;
-  if (state.pos.tokensHeld > 0n) {
-    state.pos.avgEntrySolPerToken =
-      state.pos.initialSolIn / Number(state.pos.tokensHeld);
-  }
+  return { ixs, signers: [] as Keypair[], amountBought: new BN(1) };
 }
 
-// -------------------- SELL -------------------- //
+/** Anchor-path SELL (from sniper-bot.ts) */
+async function ixSellPump_Anchor(mint: PublicKey, amount: BN) {
+  const accounts = await getPumpAccounts(mint, WALLET);
+  const minSolOutput = new BN(0);
 
-async function buildAndSendSell(mint: PublicKey, rawTokenAmount: bigint) {
-  if (rawTokenAmount <= 0n) return;
-  const accounts = await getPumpAccounts(mint, WALLET, pumpProgram, connection);
+  const ixs: anchor.web3.TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5000 }),
+  ];
 
-  const ixs: anchor.web3.TransactionInstruction[] = [];
-  if (state.cfg.cuPrice > 0)
-    ixs.push(
-      ComputeBudgetProgram.setComputeUnitPrice({
-        microLamports: state.cfg.cuPrice,
-      })
-    );
-  ixs.push(
-    ComputeBudgetProgram.setComputeUnitLimit({ units: state.cfg.cuLimit })
-  );
-
-  const minSolOutput = new BN(0); // slippage not enforced per your spec
   const sellIx = await pumpProgram.methods
-    .sell(new BN(rawTokenAmount.toString()), minSolOutput)
-    .accounts(accounts)
+    .sell(amount, minSolOutput)
+    .accounts(accounts as any)
     .instruction();
 
   ixs.push(sellIx);
+  return { ixs, signers: [] as Keypair[] };
+}
 
+/** RAW discriminator BUY (from buy-from-pump.ts) */
+async function ixBuyPump_Raw(mint: PublicKey, curve: PublicKey, associatedBondingCurve: PublicKey, lamportsIn: number) {
+  // Build data
+  const amount = new BN(1);
+  const maxSolCost = new BN(lamportsIn);
+  const data = Buffer.alloc(BUY_DISCRIMINATOR.length + 16);
+  BUY_DISCRIMINATOR.copy(data, 0);
+  // Encode two u64 (amount, maxSolCost):
+  data.writeBigUInt64LE(BigInt(amount.toString()), BUY_DISCRIMINATOR.length + 0);
+  data.writeBigUInt64LE(BigInt(maxSolCost.toString()), BUY_DISCRIMINATOR.length + 8);
+
+  // Accounts
+  const userATA = getAssociatedTokenAddressSync(mint, WALLET, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+  const globalVol = PublicKey.findProgramAddressSync([Buffer.from("global_volume_accumulator")], PUMP_PROGRAM_ID)[0];
+  const userVol = PublicKey.findProgramAddressSync([Buffer.from("user_volume_accumulator"), WALLET.toBuffer()], PUMP_PROGRAM_ID)[0];
+
+  // Fallback creator vault (the raw path needs it passed explicitly)
+  const keys = [
+    { pubkey: RAW_GLOBAL_PDA, isSigner: false, isWritable: false },
+    { pubkey: new PublicKey("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"), isSigner: false, isWritable: true }, // pool?
+    { pubkey: mint, isSigner: false, isWritable: false },
+    { pubkey: curve, isSigner: false, isWritable: true },
+    { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+    { pubkey: userATA, isSigner: false, isWritable: true },
+    { pubkey: WALLET, isSigner: true, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: CREATOR_VAULT_FALLBACK, isSigner: false, isWritable: true },
+    { pubkey: RAW_EVENT_AUTHORITY, isSigner: false, isWritable: false },
+    { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: globalVol, isSigner: false, isWritable: true },
+    { pubkey: userVol, isSigner: false, isWritable: true },
+  ];
+
+  const ix = new anchor.web3.TransactionInstruction({ keys, programId: PUMP_PROGRAM_ID, data });
+  const ixs = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
+    ix,
+  ];
+  return { ixs, signers: [] as Keypair[], amountBought: new BN(1) };
+}
+
+/** RAW discriminator SELL (from buy-from-pump.ts) */
+async function ixSellPump_Raw(mint: PublicKey, curve: PublicKey, associatedBondingCurve: PublicKey) {
+  // Fetch our ATA to sell full balance
+  const userATA = getAssociatedTokenAddressSync(mint, WALLET, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+  const tokenAcc = await getAccount(connection, userATA);
+  const amount = new BN(tokenAcc.amount.toString());
+
+  const data = Buffer.alloc(SELL_DISCRIMINATOR.length + 16);
+  SELL_DISCRIMINATOR.copy(data, 0);
+  // Encode two u64 (amount, minSolOutput)
+  data.writeBigUInt64LE(BigInt(amount.toString()), SELL_DISCRIMINATOR.length + 0);
+  data.writeBigUInt64LE(BigInt(0), SELL_DISCRIMINATOR.length + 8);
+
+  const keys = [
+    { pubkey: RAW_GLOBAL_PDA, isSigner: false, isWritable: false },
+    { pubkey: new PublicKey("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"), isSigner: false, isWritable: true }, // pool?
+    { pubkey: mint, isSigner: false, isWritable: false },
+    { pubkey: curve, isSigner: false, isWritable: true },
+    { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+    { pubkey: userATA, isSigner: false, isWritable: true },
+    { pubkey: WALLET, isSigner: true, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: CREATOR_VAULT_FALLBACK, isSigner: false, isWritable: true },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: RAW_EVENT_AUTHORITY, isSigner: false, isWritable: false },
+    { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false },
+  ];
+
+  const ix = new anchor.web3.TransactionInstruction({ keys, programId: PUMP_PROGRAM_ID, data });
+  return { ixs: [ix], signers: [] as Keypair[] };
+}
+
+/* ------------------------------ STATE / FLOW ----------------------------- */
+
+const buys: Record<string, { buySlot: number; amount: BN }> = {};
+
+async function sendTx(ixs: anchor.web3.TransactionInstruction[], signers: Keypair[] = []) {
   const tx = new Transaction().add(...ixs);
   tx.feePayer = WALLET;
-  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR], {
-    commitment: "confirmed",
-  });
-  console.log(`💸 SELL ${rawTokenAmount.toString()} tokens → ${sig}`);
+  const sig = await sendAndConfirmTransaction(connection, tx, [KEYPAIR, ...signers]);
+  return sig;
 }
 
-// -------------------- Profit Guard (quote helper) -------------------- //
+async function doInitialBuy(mint: PublicKey, solAmount: number) {
+  const lamports = Math.floor(solAmount * 1e9);
+  // Ensure our ATA exists (regardless of path)
+  const { ata, ixMaybe } = await ensureAta(WALLET, mint);
+  const ixs: anchor.web3.TransactionInstruction[] = [];
+  if (ixMaybe) ixs.push(ixMaybe); // optimistic ATA create
 
-async function tryQuoteSellSOL(
-  _mint: PublicKey,
-  _tokenAmount: bigint
-): Promise<number | null> {
-  // Placeholder (no guaranteed on-chain quote). If your program emits `sol_out` in simulate logs,
-  // we can wire a simulation + regex here. For now we rely on Buy logs price or --allow_unquoted.
-  return null;
-}
+  let built, boughtAmount: BN;
 
-// -------------------- Buy Event Parser -------------------- //
-
-type BuyEvent = { mint: string; buyerSol: number; priceSolPerToken?: number };
-
-function parseBuyEventFromLogs(logs: string[]): BuyEvent | null {
-  // Looks for a generic "Program log: Buy ..." style line.
-  const line = logs.find((l) => l.includes("Program log:") && /Buy/i.test(l));
-  if (!line) return null;
-
-  const mintMatch = line.match(/mint=([1-9A-HJ-NP-Za-km-z]{32,44})/);
-  const solMatch = line.match(/buyer[_ ]?sol=([0-9.]+)/i);
-  const priceMatch = line.match(/price=([0-9.]+)/i);
-
-  if (!mintMatch || !solMatch) return null;
-  return {
-    mint: mintMatch[1],
-    buyerSol: Number(solMatch[1]),
-    priceSolPerToken: priceMatch ? Number(priceMatch[1]) : undefined,
-  };
-}
-
-// -------------------- Auto-sell Engine -------------------- //
-
-async function maybeAutoSell(
-  mint: PublicKey,
-  slot: number,
-  buyerSol: number,
-  lastPrice?: number
-) {
-  if (state.pos.tokensHeld <= 0n || state.pos.initialSolIn <= 0) return;
-  if (state.pos.lastSellSlot === slot) return; // 1 sell per slot
-
-  const frac = fractionToSell(buyerSol, state.pos.initialSolIn);
-  if (frac <= 0) return;
-
-  const toSell = BigInt(Math.floor(Number(state.pos.tokensHeld) * frac));
-  if (toSell < 1n) return;
-
-  // Profit guard
-  let estSolOut: number | null = await tryQuoteSellSOL(mint, toSell);
-  if (!estSolOut && lastPrice && state.pos.avgEntrySolPerToken) {
-    estSolOut = Number(toSell) * lastPrice * 0.985; // haircut
-  }
-
-  if (estSolOut && state.pos.avgEntrySolPerToken) {
-    const estEntry = Number(toSell) * state.pos.avgEntrySolPerToken;
-    const pnl = (estSolOut - estEntry) / Math.max(estEntry, 1e-12);
-    const pnlBps = Math.floor(pnl * 10_000);
-    if (pnlBps < state.cfg.minProfitBps) {
-      if (state.cfg.verbose) {
-        console.log(
-          `🟨 slot ${slot}: buyer=${fmt(
-            buyerSol
-          )} SOL → proposed sell ${fmt(
-            frac * 100
-          )}% but est PnL ${pnlBps}bps < ${state.cfg.minProfitBps}bps. Skip.`
-        );
-      }
-      return;
-    }
+  if (!USE_RAW_DISCRIMINATOR_BUILD) {
+    // Anchor path
+    const { ixs: buyIxs, signers, amountBought } = await ixBuyPump_Anchor(mint, lamports);
+    ixs.push(...buyIxs);
+    const sig = await sendTx(ixs, signers);
+    console.log(`✅ Buy tx: https://solscan.io/tx/${sig}`);
+    boughtAmount = amountBought;
   } else {
-    if (!argv.allow_unquoted) {
-      if (state.cfg.verbose)
-        console.log(
-          `🟨 slot ${slot}: no quote & price missing; skipping sell (use --allow_unquoted to override).`
-        );
-      return;
-    }
-    // proceed without quote
+    // RAW path requires CURVE + associatedBondingCurve — derive them
+    const [bondingCurve] = await PublicKey.findProgramAddress([Buffer.from("bonding-curve"), mint.toBuffer()], PUMP_PROGRAM_ID);
+    const associatedBondingCurve = getAssociatedTokenAddressSync(mint, bondingCurve, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
+
+    const { ixs: buyIxs, signers, amountBought } = await ixBuyPump_Raw(mint, bondingCurve, associatedBondingCurve, lamports);
+    ixs.push(...buyIxs);
+    const sig = await sendTx(ixs, signers);
+    console.log(`✅ Buy tx: https://solscan.io/tx/${sig}`);
+    boughtAmount = amountBought;
   }
 
-  await buildAndSendSell(mint, toSell);
-  state.pos.tokensHeld -= toSell;
-  state.pos.lastSellSlot = slot;
+  const buySlot = await connection.getSlot("confirmed");
+  buys[mint.toBase58()] = { buySlot, amount: boughtAmount };
 }
 
-// -------------------- Program Logs Subscription -------------------- //
+async function doAutoSellAfterBlocks(mint: PublicKey, blocks: number) {
+  console.log(`⏳ Will auto-sell ${mint.toBase58()} after ${blocks} blocks...`);
+  const sub = connection.onSlotChange(async (slotInfo) => {
+    const mintStr = mint.toBase58();
+    const entry = buys[mintStr];
+    if (!entry) return;
+    if (slotInfo.slot - entry.buySlot >= blocks) {
+      // Build SELL
+      if (!USE_RAW_DISCRIMINATOR_BUILD) {
+        const { ixs, signers } = await ixSellPump_Anchor(mint, entry.amount);
+        const sig = await sendTx(ixs, signers);
+        console.log(`💸 Sold (anchor) tx: https://solscan.io/tx/${sig}`);
+      } else {
+        const [bondingCurve] = await PublicKey.findProgramAddress([Buffer.from("bonding-curve"), mint.toBuffer()], PUMP_PROGRAM_ID);
+        const associatedBondingCurve = getAssociatedTokenAddressSync(mint, bondingCurve, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
 
-function subscribeBuyEvents(mint: PublicKey) {
-  const subId = connection.onLogs(
-    PUMP_PROGRAM_ID,
-    async (res) => {
-      try {
-        const ev = parseBuyEventFromLogs(res.logs || []);
-        if (!ev || ev.mint !== mint.toBase58()) return;
-
-        console.log(
-          `🔔 Buy detected @slot ${res.slot}: ${fmt(
-            ev.buyerSol
-          )} SOL on mint ${ev.mint}`
-        );
-        await maybeAutoSell(mint, res.slot, ev.buyerSol, ev.priceSolPerToken);
-      } catch (e) {
-        console.error("onLogs handler error:", e);
+        const { ixs, signers } = await ixSellPump_Raw(mint, bondingCurve, associatedBondingCurve);
+        const sig = await sendTx(ixs, signers);
+        console.log(`💸 Sold (raw) tx: https://solscan.io/tx/${sig}`);
       }
-    },
-    "confirmed"
-  );
-  console.log(
-    `👂 Listening for Buy events on ${mint.toBase58()} (subId=${subId})`
-  );
-  return subId;
-}
-
-// -------------------- Optional: scan your creations -------------------- //
-
-function extractAccounts(ix: ParsedInstruction | PartiallyDecodedInstruction): string[] {
-  if ("accounts" in ix && (ix as any).accounts) {
-    return (ix as any).accounts.map((a: any) =>
-      typeof a === "string" ? a : a?.toBase58?.() || String(a)
-    );
-  }
-  return [];
-}
-
-async function getPumpCreations(conn: Connection, wallet: PublicKey, limit: number) {
-  const signatures = await conn.getSignaturesForAddress(wallet, { limit });
-  const results: any[] = [];
-
-  for (const { signature, blockTime } of signatures) {
-    const tx = await conn.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-    });
-    if (!tx) continue;
-
-    for (const ix of tx.transaction.message
-      .instructions as (ParsedInstruction | PartiallyDecodedInstruction)[]) {
-      const progId =
-        (ix as any).programId?.toBase58?.() || (ix as any).programId || "";
-      if (progId === PUMP_PROGRAM_ID.toBase58()) {
-        const accounts = extractAccounts(ix);
-        results.push({
-          signature,
-          mint: accounts[0] || "",
-          pool: accounts[0] || "",
-          blockTime: blockTime || 0,
-          foundIn: "top-level",
-          allAccounts: accounts,
-        });
-      }
+      delete buys[mintStr];
+      connection.removeSlotChangeListener(sub);
     }
-
-    if (tx.meta?.innerInstructions) {
-      for (const inner of tx.meta.innerInstructions) {
-        for (const ix of inner.instructions as (ParsedInstruction | PartiallyDecodedInstruction)[]) {
-          const progId =
-            (ix as any).programId?.toBase58?.() ||
-            (ix as any).programId ||
-            "";
-          if (progId === PUMP_PROGRAM_ID.toBase58()) {
-            const accounts = extractAccounts(ix);
-            results.push({
-              signature,
-              mint: accounts[0] || "",
-              pool: accounts[0] || "",
-              blockTime: blockTime || 0,
-              foundIn: "inner",
-              allAccounts: accounts,
-            });
-          }
-        }
-      }
-    }
-  }
-  return results;
+  });
 }
 
-// -------------------- MAIN -------------------- //
+/* --------------------------------- MAIN ---------------------------------- */
 
 (async () => {
-  console.log(`👤 Wallet: ${WALLET.toBase58()}`);
-  console.log(`🔗 RPC: ${argv.rpc}`);
-  console.log(
-    `⚙️ CU: limit=${state.cfg.cuLimit}, price=${state.cfg.cuPrice} μLamports`
-  );
-  console.log(`🔧 Profit guard: >= ${state.cfg.minProfitBps} bps`);
+  console.log("🔧 RPC:", argv.rpc);
+  console.log("👤 Wallet:", WALLET.toBase58());
 
-  let targetMint: PublicKey | null = argv.mint ? new PublicKey(argv.mint) : null;
+  if (!argv.mint) {
+    throw new Error("Please provide --mint <base_mint_address>");
+  }
+  const mint = new PublicKey(argv.mint);
 
-  // 1) Optional: create a token first
-  if (argv.create) {
-    if (!argv.name || !argv.symbol || !argv.uri) {
-      throw new Error("For --create you must provide --name, --symbol, and --uri");
-    }
-    targetMint = await createPumpToken(argv.name, argv.symbol, argv.uri);
+  if (argv.buy && argv.sol > 0) {
+    await doInitialBuy(mint, argv.sol);
   }
 
-  // 2) Optional: discover your latest creation if no mint provided
-  if (!targetMint && argv.watch_creations) {
-    const items = await getPumpCreations(
-      connection,
-      WALLET,
-      Math.max(argv.scan_limit ?? 30, 30)
-    );
-    if (items.length && items[0].mint) {
-      targetMint = new PublicKey(items[0].mint);
-      console.log(`🆕 Latest created mint detected: ${targetMint.toBase58()}`);
-    } else {
-      console.log("No recent Pump.fun creations found for your wallet.");
-    }
-  }
-
-  if (!targetMint) {
-    console.log("No target mint. Provide --mint, or use --create, or --watch-creations.");
-    return;
-  }
-
-  // 3) Optional: initial buy in SOL
-  if (argv.buy) {
-    const solToSpend = Number(argv.sol);
-    if (!(solToSpend > 0)) throw new Error("--sol must be > 0 with --buy");
-    await buildAndSendBuy_SOLCap(targetMint, solToSpend);
-  } else {
-    // If you already hold tokens, prime position for auto-sell
-    try {
-      const ata = await getAssociatedTokenAddress(targetMint, WALLET);
-      const acct = await getAccount(connection, ata);
-      state.pos.tokensHeld = BigInt(acct.amount.toString());
-      console.log(
-        `📦 Position (pre-existing): tokensHeld=${state.pos.tokensHeld.toString()}`
-      );
-    } catch {
-      console.log("ℹ️ No tokens currently held (or ATA missing).");
-    }
-  }
-
-  // 4) Auto-sell listener
   if (argv.auto) {
-    subscribeBuyEvents(targetMint);
+    await doAutoSellAfterBlocks(mint, argv.blocks);
   } else {
-    console.log("ℹ️ Auto-sell listener disabled (--auto=false).");
+    // Not auto-running; exit after optional buy
+    process.exit(0);
   }
-
-  console.log("🏁 Running. CTRL+C to exit.");
 })().catch((e) => {
   console.error("❌ Error:", e);
   process.exit(1);
